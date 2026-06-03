@@ -403,50 +403,246 @@ with tab_max:
 
 # ── Tab Mon portefeuille ───────────────────────────────────────────────────────
 with tab_custom:
-    st.caption(
-        "Sélectionne tes actifs ci-dessous (ou commence à taper pour filtrer). "
-        "Tu peux chercher des ETFs européens, actions US, crypto, indices…"
-    )
 
-    # Multiselect = portfolio selector (same layout as Maxence below-chart selector)
-    all_labels = list(PRESET_MAP.keys())
-    default_sel = st.session_state.get("custom_selection", [])
-    # Keep only labels still in the preset map
-    default_sel = [l for l in default_sel if l in PRESET_MAP]
+    # Period selector
+    period_c = st.segmented_control(
+        "Période", list(PERIODS.keys()), default="1A",
+        key="period_custom", label_visibility="collapsed"
+    ) or "1A"
+    pk_c = PERIODS[period_c]
 
-    selection = st.multiselect(
-        "Mes actifs",
-        options=all_labels,
-        default=default_sel,
-        placeholder="Rechercher : Apple, CW8, Bitcoin, CAC 40…",
-        label_visibility="collapsed",
-        key="custom_ms_top"
-    )
-    st.session_state["custom_selection"] = selection
+    # ── Reserve space: metrics then chart (filled AFTER the selector below) ──
+    metrics_slot = st.container()
+    chart_slot   = st.container()
+    st.markdown("")
 
-    if not selection:
-        st.info(
-            "👆 Tape le nom d'un actif pour le trouver et l'ajouter à ton portefeuille.\n\n"
-            "Exemples : `MSCI World`, `Apple`, `Bitcoin`, `CAC`, `S&P 500`…"
+    # ── Selector (below chart) ────────────────────────────────────────────
+    ca, cb = st.columns([9, 1])
+    with ca:
+        all_labels  = list(PRESET_MAP.keys())
+        default_sel = [l for l in st.session_state.get("custom_selection", [])
+                       if l in PRESET_MAP]
+        selection = st.multiselect(
+            "Actifs", all_labels, default=default_sel,
+            placeholder="🔍  Tape : Apple, CW8, Bitcoin, CAC 40, MSCI World…",
+            label_visibility="collapsed", key="custom_select"
         )
-    else:
-        etf_custom = [
-            {**PRESET_MAP[lbl],
-             "name": PRESET_MAP[lbl]["ticker"].split(".")[0].upper()[:6],
-             "color": PALETTE[i%len(PALETTE)]}
-            for i, lbl in enumerate(selection)
-        ]
-        # Reset custom visibility when selection changes
-        if set(st.session_state.get("vis_custom") or []) != \
-           set(e["name"] for e in etf_custom):
-            st.session_state["vis_custom"] = [e["name"] for e in etf_custom]
+        st.session_state["custom_selection"] = selection
+    with cb:
+        if st.button("Vider", key="clear_c", use_container_width=True):
+            st.session_state["custom_selection"] = []
+            st.session_state["vis_custom"] = None
+            st.rerun()
 
-        with st.spinner("Chargement…"):
-            prices_custom = load_prices(",".join(e["ticker"] for e in etf_custom))
-        if prices_custom.empty:
-            st.error("Impossible de charger les données. Vérifier les symboles.")
+    # ── Fill chart_slot ───────────────────────────────────────────────────
+    with chart_slot:
+        if not selection:
+            # Empty chart with hint
+            fig_e = go.Figure()
+            fig_e.update_layout(
+                height=340,
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.05)", showticklabels=False),
+                yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.05)", showticklabels=False),
+                annotations=[dict(
+                    text="<b style='color:#94a3b8'>Recherche et sélectionne des actifs ci-dessous<br>"
+                         "<span style='font-size:13px'>ETFs · Actions · Crypto · Indices</span></b>",
+                    showarrow=False, xref="paper", yref="paper",
+                    x=0.5, y=0.5, align="center",
+                    font=dict(size=16, color="#94a3b8")
+                )]
+            )
+            st.plotly_chart(fig_e, width="stretch")
         else:
-            render_dashboard(etf_custom, prices_custom, "custom")
+            etf_c = [
+                {**PRESET_MAP[lbl],
+                 "name":  PRESET_MAP[lbl]["ticker"].split(".")[0].upper()[:6],
+                 "color": PALETTE[i % len(PALETTE)]}
+                for i, lbl in enumerate(selection)
+            ]
+            # Sync visibility state when portfolio changes
+            cur_names = [e["name"] for e in etf_c]
+            if set(st.session_state.get("vis_custom") or []) - set(cur_names):
+                st.session_state["vis_custom"] = cur_names[:]
+
+            with st.spinner("Chargement…"):
+                prices_c = load_prices(",".join(e["ticker"] for e in etf_c))
+
+            if prices_c.empty:
+                st.error("Données introuvables — vérifier les symboles.")
+            else:
+                avail_c = [e for e in etf_c if e["ticker"] in prices_c.columns]
+                start_c = period_start(pk_c)
+                sl_c    = prices_c.loc[prices_c.index >= start_c]
+
+                # ── Metrics (in reserved slot above chart) ─────────────────
+                rets_c = {e["name"]: pct_ret(sl_c[e["ticker"]].dropna())
+                          for e in avail_c}
+                valid_c = {k: v for k, v in rets_c.items() if v is not None}
+                with metrics_slot:
+                    if valid_c:
+                        bk = max(valid_c, key=valid_c.get)
+                        wk = min(valid_c, key=valid_c.get)
+                        be = next(e for e in avail_c if e["name"] == bk)
+                        we = next(e for e in avail_c if e["name"] == wk)
+                        cc1,cc2,cc3,cc4 = st.columns(4)
+                        cc1.metric("🏆 Meilleur", be["label"], f"{valid_c[bk]:+.1f}%")
+                        cc2.metric("📉 Pire",     we["label"], f"{valid_c[wk]:+.1f}%")
+                        cc3.metric("∅ Moyenne", f"{np.mean(list(valid_c.values())):+.1f}%")
+                        cc4.metric("Actifs", str(len(avail_c)))
+                        st.markdown("")
+
+                # ── Chart (in reserved slot) ───────────────────────────────
+                vis_set_c = set(st.session_state.get("vis_custom") or cur_names)
+                shown_c   = [e for e in avail_c if e["name"] in vis_set_c]
+                fig_c = go.Figure()
+                for e in shown_c:
+                    s = sl_c[e["ticker"]].dropna()
+                    if len(s) < 2: continue
+                    pct_s = (s / s.iloc[0] * 100 - 100).round(2)
+                    last  = pct_s.iloc[-1]
+                    fig_c.add_trace(go.Scatter(
+                        x=pct_s.index, y=pct_s.values, name=e["label"],
+                        line=dict(color=e["color"], width=2),
+                        hovertemplate=(
+                            f"<b>{e['label']}</b><br>"
+                            "%{x|%d/%m/%Y}<br><b>%{y:+.1f}%</b><extra></extra>"
+                        )
+                    ))
+                    fig_c.add_annotation(
+                        x=pct_s.index[-1], y=last,
+                        text=f" {last:+.1f}%", showarrow=False, xanchor="left",
+                        font=dict(size=11, color=e["color"], weight=700)
+                    )
+                fig_c.update_layout(
+                    height=400, margin=dict(l=0, r=80, t=10, b=0),
+                    hovermode="x unified",
+                    legend=dict(orientation="h", y=-0.15, font=dict(size=11),
+                                itemclick="toggle", itemdoubleclick="toggleothers"),
+                    xaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.05)",
+                               zeroline=False, tickfont=dict(size=11)),
+                    yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.05)",
+                               tickformat="+.0f", ticksuffix="%",
+                               zeroline=True, zerolinecolor="rgba(0,0,0,0.2)",
+                               zerolinewidth=1.5),
+                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+                )
+                st.plotly_chart(fig_c, width="stretch")
+                st.caption("💡 Cliquer sur un actif dans la légende pour le masquer · Double-clic pour l'isoler")
+
+                # ── Visibility toggle (mirrors logic from render_dashboard) ─
+                st.markdown("")
+                ca2, cb2 = st.columns([9, 1])
+                with cb2:
+                    all_sel_c = set(st.session_state.get("vis_custom", cur_names)) >= set(cur_names)
+                    if st.button("Tout ✓" if not all_sel_c else "Tout ✗",
+                                 key="all_c", use_container_width=True):
+                        st.session_state["vis_custom"] = (
+                            cur_names[:] if not all_sel_c else [cur_names[0]]
+                        )
+                        st.rerun()
+                with ca2:
+                    sel_vis = st.multiselect(
+                        "Visibles", cur_names,
+                        default=list(vis_set_c & set(cur_names)) or [cur_names[0]],
+                        format_func=lambda x: next(
+                            (e["label"] for e in avail_c if e["name"] == x), x
+                        ),
+                        label_visibility="collapsed", key="vis_c_ms"
+                    )
+                    if set(sel_vis) != vis_set_c:
+                        st.session_state["vis_custom"] = sel_vis or [cur_names[0]]
+                        st.rerun()
+
+                st.markdown("")
+                # ── Tables ─────────────────────────────────────────────────
+                with st.expander("📋 Tableau de performances", expanded=True):
+                    st.caption("Rendements sur chaque période, triés par la période sélectionnée.")
+                    rows_c = []
+                    for e in avail_c:
+                        row = {"Actif": e["label"], "Ticker": e["name"]}
+                        for lbl, key in PERIODS.items():
+                            sl2 = prices_c.loc[prices_c.index >= period_start(key),
+                                               e["ticker"]].dropna()
+                            row[lbl] = pct_ret(sl2)
+                        rows_c.append(row)
+                    df_c = pd.DataFrame(rows_c).set_index("Actif")
+                    df_cs = df_c.sort_values(period_c, ascending=False)
+                    cols_pc = [c for c in PERIODS if c in df_cs.columns]
+                    st.dataframe(
+                        df_cs.style
+                            .format(fmt_pct, subset=cols_pc)
+                            .map(color_cell, subset=cols_pc)
+                            .set_properties(**{"text-align": "right"})
+                            .set_properties(subset=["Ticker"],
+                                            **{"color": "#aaa", "font-size": "11px"})
+                            .highlight_between(subset=[period_c],
+                                               props="background-color:rgba(37,99,235,0.06)"),
+                        width="stretch",
+                        height=min(80 + len(avail_c) * 36, 600)
+                    )
+
+                with st.expander("🗓 Heatmap mensuelle", expanded=False):
+                    st.caption("ℹ️ Rendement de chaque actif par mois. Vert = hausse, rouge = baisse.")
+                    N=18
+                    ms=pd.date_range(end=today+pd.offsets.MonthBegin(1),periods=N+1,freq="MS")
+                    ml=[d.strftime("%b %y") for d in ms[:-1]]
+                    zh,th,yn=[],[],[]
+                    for e in avail_c:
+                        rz,rt=[],[]
+                        for i in range(N):
+                            slm=prices_c.loc[(prices_c.index>=ms[i])&(prices_c.index<ms[i+1]),
+                                             e["ticker"]].dropna()
+                            v=pct_ret(slm)
+                            rz.append(v if v is not None else float("nan"))
+                            rt.append(f"{v:+.1f}%" if v is not None and v>=0 else
+                                      (f"{v:.1f}%" if v is not None else "—"))
+                        zh.append(rz); th.append(rt); yn.append(e["name"])
+                    fh=go.Figure(go.Heatmap(
+                        z=zh,x=ml,y=yn,text=th,texttemplate="%{text}",
+                        textfont=dict(size=10),
+                        colorscale=[[0,"#DC2626"],[0.5,"#f8fafc"],[1,"#16A34A"]],
+                        zmid=0,zmin=-8,zmax=8,
+                        hovertemplate="%{y} · %{x} : <b>%{text}</b><extra></extra>",
+                        showscale=True,colorbar=dict(ticksuffix="%",len=0.7,thickness=10)
+                    ))
+                    fh.update_layout(
+                        height=max(280,len(avail_c)*32+60),
+                        margin=dict(l=0,r=0,t=10,b=0),
+                        xaxis=dict(tickfont=dict(size=10),side="top"),
+                        yaxis=dict(tickfont=dict(size=11),autorange="reversed"),
+                        plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)"
+                    )
+                    st.plotly_chart(fh, width="stretch")
+
+                with st.expander("🔗 Corrélations — 1 an", expanded=False):
+                    st.caption("ℹ️ 1.0 = actifs identiques · 0 = aucun lien · -1 = inverses. "
+                               "Idéalement, diversifier avec des actifs faiblement corrélés.")
+                    cs2=prices_c.loc[prices_c.index>=period_start("1y"),
+                                     [e["ticker"] for e in avail_c]].dropna()
+                    if len(cs2)>=20:
+                        lr=np.log(cs2/cs2.shift(1)).dropna()
+                        cm=lr.corr().round(2)
+                        ns=[e["name"] for e in avail_c if e["ticker"] in cm.columns]
+                        fc=go.Figure(go.Heatmap(
+                            z=cm.values.tolist(),x=ns,y=ns,
+                            text=[[f"{v:.2f}" for v in row] for row in cm.values],
+                            texttemplate="%{text}",textfont=dict(size=11),
+                            colorscale=[[0,"#DC2626"],[0.5,"#f8fafc"],[1,"#16A34A"]],
+                            zmid=0,zmin=-1,zmax=1,
+                            hovertemplate="%{y} / %{x} : <b>%{text}</b><extra></extra>",
+                            showscale=True,colorbar=dict(len=0.7,thickness=10)
+                        ))
+                        fc.update_layout(
+                            height=max(300,len(ns)*44+60),
+                            margin=dict(l=0,r=0,t=10,b=0),
+                            xaxis=dict(tickfont=dict(size=11),side="top"),
+                            yaxis=dict(tickfont=dict(size=11),autorange="reversed"),
+                            plot_bgcolor="rgba(0,0,0,0)",paper_bgcolor="rgba(0,0,0,0)"
+                        )
+                        st.plotly_chart(fc, width="stretch")
+                    else:
+                        st.caption("Données insuffisantes.")
 
 st.divider()
 st.caption("Source : Yahoo Finance · Données auto-ajustées")
