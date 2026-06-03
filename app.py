@@ -1,5 +1,6 @@
 """Portfolio Dashboard — Streamlit App"""
 import streamlit as st
+import streamlit.components.v1 as components  # noqa: imported for html injection
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -24,6 +25,10 @@ button[data-baseweb="tab"]{font-size:14px !important;font-weight:500 !important;
 [data-testid="stMetricValue"]{font-size:1.3rem !important;font-weight:700 !important;}
 [data-testid="stMetricLabel"]{font-size:.72rem !important;color:#888 !important;text-transform:uppercase;letter-spacing:.4px;}
 div[data-testid="stSegmentedControl"] button{font-size:12px !important;padding:4px 11px !important;}
+/* Multiselect pills — base neutral (JS will override per-ETF color) */
+[data-baseweb="tag"]{background-color:#475569 !important;border-color:#475569 !important;}
+[data-baseweb="tag"] span{color:#fff !important;}
+[data-baseweb="tag"] [role="presentation"]{color:#fff !important;opacity:.8;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -184,6 +189,104 @@ for k,v in [("vis_default",None),("vis_custom",None),("custom_selection",[])]:
 # ══════════════════════════════════════════════════════════════════════════════
 # Dashboard renderer
 # ══════════════════════════════════════════════════════════════════════════════
+def _run_portfolio_analysis(avail, prices, period_label, pk):
+    """Rule-based portfolio analysis — no API key required."""
+    lines = []
+    start = period_start(pk)
+    sliced = prices.loc[prices.index >= start]
+
+    # ── Performance ranking ────────────────────────────────────────────────
+    rets = {}
+    for e in avail:
+        r = pct_ret(sliced[e["ticker"]].dropna())
+        if r is not None:
+            rets[e["name"]] = (r, e["label"])
+
+    if rets:
+        ranked = sorted(rets.values(), key=lambda x: x[0], reverse=True)
+        pos = sum(1 for r, _ in ranked if r > 0)
+        lines.append(f"### 📊 Performance — {period_label}")
+        lines.append(f"- **{pos}/{len(ranked)}** actifs en positif sur la période.")
+        lines.append(f"- 🥇 Meilleur : **{ranked[0][1]}** à **{ranked[0][0]:+.1f}%**")
+        lines.append(f"- 🔻 Pire : **{ranked[-1][1]}** à **{ranked[-1][0]:+.1f}%**")
+        spread = ranked[0][0] - ranked[-1][0]
+        if spread > 30:
+            lines.append(f"- ⚠️ Écart de **{spread:.0f} pp** entre le meilleur et le pire : "
+                         f"tes actifs ont des profils très différents.")
+
+    # ── Correlation ────────────────────────────────────────────────────────
+    cs = prices.loc[prices.index >= period_start("1y"),
+                    [e["ticker"] for e in avail]].dropna()
+    if len(cs) >= 30 and len(avail) >= 2:
+        lr = np.log(cs / cs.shift(1)).dropna()
+        cm = lr.corr()
+        pairs_high, pairs_low = [], []
+        for i, e1 in enumerate(avail):
+            for j, e2 in enumerate(avail):
+                if i >= j: continue
+                if e1["ticker"] not in cm.columns or e2["ticker"] not in cm.columns:
+                    continue
+                c = cm.loc[e1["ticker"], e2["ticker"]]
+                if c > 0.85:
+                    pairs_high.append((e1["label"], e2["label"], c))
+                elif c < 0.2:
+                    pairs_low.append((e1["label"], e2["label"], c))
+
+        lines.append("\n### 🔗 Corrélations")
+        if pairs_high:
+            for a, b, c in pairs_high[:3]:
+                lines.append(f"- ⚠️ **{a}** et **{b}** sont fortement corrélés ({c:.2f}) "
+                              f"— risque de redondance.")
+        else:
+            lines.append("- ✅ Pas de paires fortement corrélées (>0.85) — "
+                         "bonne diversification sur ce plan.")
+        if pairs_low:
+            for a, b, c in pairs_low[:2]:
+                lines.append(f"- ✅ **{a}** et **{b}** sont très peu corrélés ({c:.2f}) "
+                              f"— bonne complémentarité.")
+
+        # Average off-diagonal correlation
+        vals = [cm.loc[e1["ticker"], e2["ticker"]]
+                for i, e1 in enumerate(avail) for j, e2 in enumerate(avail)
+                if i < j and e1["ticker"] in cm.columns and e2["ticker"] in cm.columns]
+        if vals:
+            avg_c = np.mean(vals)
+            if avg_c > 0.7:
+                lines.append(f"- ⚠️ Corrélation moyenne : **{avg_c:.2f}** — "
+                              f"les actifs ont tendance à bouger ensemble.")
+            elif avg_c < 0.4:
+                lines.append(f"- ✅ Corrélation moyenne : **{avg_c:.2f}** — "
+                              f"portefeuille bien diversifié.")
+
+    # ── Volatility ─────────────────────────────────────────────────────────
+    vols = {}
+    for e in avail:
+        s = prices[e["ticker"]].dropna()
+        if len(s) > 30:
+            lr2 = np.log(s / s.shift(1)).dropna()
+            vols[e["name"]] = (lr2.std() * np.sqrt(252) * 100, e["label"])
+
+    if vols:
+        lines.append("\n### 📈 Risque & volatilité")
+        sv = sorted(vols.values(), key=lambda x: x[0], reverse=True)
+        lines.append(f"- Plus volatile : **{sv[0][1]}** (~{sv[0][0]:.0f}%/an)")
+        lines.append(f"- Plus stable   : **{sv[-1][1]}** (~{sv[-1][0]:.0f}%/an)")
+        high_vol = [label for vol, label in sv if vol > 30]
+        if high_vol:
+            lines.append(f"- ⚠️ Actifs à haute volatilité (>30%/an) : "
+                         f"{', '.join(high_vol[:3])}.")
+
+    # ── Concentration ──────────────────────────────────────────────────────
+    if len(avail) >= 3:
+        lines.append("\n### ⚖️ Concentration")
+        n = len(avail)
+        lines.append(f"- Portefeuille de **{n} actifs**. "
+                     f"{'Bien diversifié.' if n >= 6 else 'Peu diversifié — envisager dajouterdes actifs décorrélés.'}")
+
+    lines.append("\n---\n*Analyse basée sur les données Yahoo Finance — pas un conseil financier.*")
+    return lines
+
+
 def render_dashboard(etf_list, prices, tab_key):
     available = [e for e in etf_list if e["ticker"] in prices.columns]
     if not available:
@@ -233,10 +336,7 @@ def render_dashboard(etf_list, prices, tab_key):
             x=pct_s.index, y=pct_s.values,
             name=e["label"],
             line=dict(color=e["color"], width=2),
-            hovertemplate=(
-                f"<b>{e['label']} ({e['name']})</b><br>"
-                "%{x|%d/%m/%Y}<br>Performance : <b>%{y:+.1f}%</b><extra></extra>"
-            )
+            hovertemplate=f"<b style='color:{e['color']}'>{e['label']}</b>  %{{y:+.1f}}%<extra></extra>"
         ))
         fig.add_annotation(
             x=pct_s.index[-1], y=last,
@@ -247,10 +347,16 @@ def render_dashboard(etf_list, prices, tab_key):
     fig.update_layout(
         height=400, margin=dict(l=0,r=80,t=10,b=0),
         hovermode="x unified",
+        hoverlabel=dict(
+            bgcolor="white", bordercolor="rgba(0,0,0,0.12)",
+            font=dict(size=12, family="inherit"),
+            namelength=-1,
+        ),
         legend=dict(orientation="h",y=-0.15,font=dict(size=11),
                     itemclick="toggle",itemdoubleclick="toggleothers"),
         xaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.05)", zeroline=False,
-                   tickfont=dict(size=11)),
+                   tickfont=dict(size=11),
+                   hoverformat="%d %b %Y"),
         yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.05)",
                    tickformat="+.0f", ticksuffix="%",
                    zeroline=True, zerolinecolor="rgba(0,0,0,0.2)", zerolinewidth=1.5),
@@ -504,10 +610,7 @@ with tab_custom:
                     fig_c.add_trace(go.Scatter(
                         x=pct_s.index, y=pct_s.values, name=e["label"],
                         line=dict(color=e["color"], width=2),
-                        hovertemplate=(
-                            f"<b>{e['label']}</b><br>"
-                            "%{x|%d/%m/%Y}<br><b>%{y:+.1f}%</b><extra></extra>"
-                        )
+                        hovertemplate=f"<b style='color:{e['color']}'>{e['label']}</b>  %{{y:+.1f}}%<extra></extra>"
                     ))
                     fig_c.add_annotation(
                         x=pct_s.index[-1], y=last,
@@ -517,10 +620,15 @@ with tab_custom:
                 fig_c.update_layout(
                     height=400, margin=dict(l=0, r=80, t=10, b=0),
                     hovermode="x unified",
+                    hoverlabel=dict(
+                        bgcolor="white", bordercolor="rgba(0,0,0,0.12)",
+                        font=dict(size=12, family="inherit"), namelength=-1,
+                    ),
                     legend=dict(orientation="h", y=-0.15, font=dict(size=11),
                                 itemclick="toggle", itemdoubleclick="toggleothers"),
                     xaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.05)",
-                               zeroline=False, tickfont=dict(size=11)),
+                               zeroline=False, tickfont=dict(size=11),
+                               hoverformat="%d %b %Y"),
                     yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.05)",
                                tickformat="+.0f", ticksuffix="%",
                                zeroline=True, zerolinecolor="rgba(0,0,0,0.2)",
@@ -534,7 +642,7 @@ with tab_custom:
                 st.markdown("")
                 ca2, cb2 = st.columns([9, 1])
                 with cb2:
-                    all_sel_c = set(st.session_state.get("vis_custom", cur_names)) >= set(cur_names)
+                    all_sel_c = set(st.session_state.get("vis_custom") or cur_names) >= set(cur_names)
                     if st.button("Tout ✓" if not all_sel_c else "Tout ✗",
                                  key="all_c", use_container_width=True):
                         st.session_state["vis_custom"] = (
@@ -643,6 +751,64 @@ with tab_custom:
                         st.plotly_chart(fc, width="stretch")
                     else:
                         st.caption("Données insuffisantes.")
+
+                # ── JS: colour each multiselect pill to match its ETF ─────
+                color_map = {e["label"]: e["color"] for e in avail_c}
+                color_map_js = str(color_map).replace("'", '"')
+                st.components.v1.html(f"""
+<script>
+(function applyPillColors() {{
+  var map = {color_map_js};
+  var tags = document.querySelectorAll('[data-baseweb="tag"]');
+  tags.forEach(function(tag) {{
+    var span = tag.querySelector('span');
+    if (!span) return;
+    var txt = span.innerText || span.textContent || '';
+    for (var label in map) {{
+      if (txt && label.indexOf(txt.split('(')[0].trim()) !== -1 ||
+          (txt && txt.indexOf(label.split(' ')[0]) !== -1)) {{
+        tag.style.setProperty('background-color', map[label], 'important');
+        tag.style.setProperty('border-color', map[label], 'important');
+        break;
+      }}
+    }}
+  }});
+}}
+)();
+// Re-run after short delay for dynamic renders
+setTimeout(function() {{
+  var tags = document.querySelectorAll('[data-baseweb="tag"]');
+  var map = {color_map_js};
+  tags.forEach(function(tag) {{
+    var span = tag.querySelector('span');
+    if (!span) return;
+    var txt = (span.innerText || span.textContent || '').trim();
+    for (var label in map) {{
+      var shortLabel = label.split(' ')[0];
+      if (txt.indexOf(shortLabel) !== -1) {{
+        tag.style.setProperty('background-color', map[label], 'important');
+        tag.style.setProperty('border-color', map[label], 'important');
+        break;
+      }}
+    }}
+  }});
+}}, 600);
+</script>
+""", height=0)
+
+                # ── AI Analysis ────────────────────────────────────────────
+                with st.expander("🤖 Analyse IA du portefeuille", expanded=False):
+                    st.caption(
+                        "ℹ️ Analyse automatique basée sur les données de performance, "
+                        "corrélation et volatilité de tes actifs."
+                    )
+                    if st.button("✨ Générer l'analyse", key="gen_ai"):
+                        with st.spinner("Analyse en cours…"):
+                            _insights = _run_portfolio_analysis(
+                                avail_c, prices_c, period_c, pk_c
+                            )
+                        for line in _insights:
+                            st.markdown(line)
 
 st.divider()
 st.caption("Source : Yahoo Finance · Données auto-ajustées")
