@@ -194,7 +194,7 @@ fig.update_layout(
     paper_bgcolor="rgba(0,0,0,0)",
 )
 fig.add_hline(y=100, line_dash="dot", line_color="rgba(128,128,128,0.4)", line_width=1)
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 st.caption("💡 Cliquer sur un actif dans la légende pour le masquer · Double-clic pour l'isoler")
 
 # ── Performance table ──────────────────────────────────────────────────────
@@ -224,11 +224,11 @@ styled_perf = (
     df_perf_sorted
     .style
     .format(fmt_pct)
-    .applymap(color_cell)
+    .map(color_cell)
     .set_properties(**{"text-align": "right"})
     .highlight_between(subset=[period_label], props="background-color: rgba(0,0,0,0.04)")
 )
-st.dataframe(styled_perf, use_container_width=True, height=min(70 + len(available) * 36, 580))
+st.dataframe(styled_perf, width="stretch", height=min(70 + len(available) * 36, 580))
 
 # ── Monthly heatmap ────────────────────────────────────────────────────────
 st.markdown("### Rendements mensuels — 18 derniers mois")
@@ -268,7 +268,7 @@ fig_heat.update_layout(
     yaxis=dict(tickfont=dict(size=11), autorange="reversed"),
     plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
 )
-st.plotly_chart(fig_heat, use_container_width=True)
+st.plotly_chart(fig_heat, width="stretch")
 
 # ── Correlation ────────────────────────────────────────────────────────────
 st.markdown("### Matrice de corrélation — 1 an")
@@ -298,7 +298,7 @@ if len(corr_slice) >= 20:
         yaxis=dict(tickfont=dict(size=11), autorange="reversed"),
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
     )
-    st.plotly_chart(fig_corr, use_container_width=True)
+    st.plotly_chart(fig_corr, width="stretch")
 else:
     st.caption("Données insuffisantes pour calculer la corrélation.")
 
