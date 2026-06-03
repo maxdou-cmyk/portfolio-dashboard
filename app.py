@@ -222,12 +222,15 @@ def render_dashboard(etf_list, prices, tab_key):
         if len(s) < 2: continue
         pct_series = (s / s.iloc[0] * 100 - 100).round(3)
         last_val   = pct_series.iloc[-1]
+        h = e["color"].lstrip("#")
+        r_, g_, b_ = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+        fill_rgba = f"rgba({r_},{g_},{b_},0.05)"
         fig.add_trace(go.Scatter(
             x=pct_series.index, y=pct_series.values,
             name=f"{e['label']}",
             line=dict(color=e["color"], width=2),
             fill="tozeroy",
-            fillcolor=e["color"].replace("#", "rgba(") + ",0.04)" if "#" in e["color"] else e["color"],
+            fillcolor=fill_rgba,
             hovertemplate=(
                 f"<b>{e['label']} ({e['name']})</b><br>"
                 "%{x|%d/%m/%Y}<br>"
