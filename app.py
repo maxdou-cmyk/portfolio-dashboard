@@ -127,7 +127,7 @@ PRESET_TICKERS = (
 )
 PRESET_MAP = {e["label"]: e for e in PRESET_TICKERS}
 
-PERIODS = {"1S":"1w","1M":"1mo","3M":"3mo","6M":"6mo","YTD":"ytd","1A":"1y","3A":"3y","5A":"5y"}
+PERIODS = {"1J":"1d","1S":"1w","1M":"1mo","3M":"3mo","6M":"6mo","YTD":"ytd","1A":"1y","3A":"3y","5A":"5y"}
 
 # ── Timezone ───────────────────────────────────────────────────────────────────
 now_paris = datetime.now(ZoneInfo("Europe/Paris"))
@@ -136,7 +136,8 @@ now_paris = datetime.now(ZoneInfo("Europe/Paris"))
 today = pd.Timestamp.today().normalize()
 
 def period_start(key):
-    m = {"1w":pd.Timedelta(weeks=1),"1mo":pd.DateOffset(months=1),
+    m = {"1d":pd.Timedelta(days=1),"1w":pd.Timedelta(weeks=1),
+         "1mo":pd.DateOffset(months=1),
          "3mo":pd.DateOffset(months=3),"6mo":pd.DateOffset(months=6),
          "1y":pd.DateOffset(years=1),"3y":pd.DateOffset(years=3),
          "5y":pd.DateOffset(years=5)}
@@ -181,6 +182,62 @@ def load_prices(tickers_key):
         return df.dropna(how="all")
     except Exception:
         return pd.DataFrame()
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_intraday_prices(tickers_key):
+    """Hourly intraday prices for the current session (period='1d', interval='1h')."""
+    tickers = [t.strip() for t in tickers_key.split(",") if t.strip()]
+    if not tickers: return pd.DataFrame()
+    try:
+        data = yf.download(tickers, period="1d", interval="1h",
+                           auto_adjust=True, progress=False)
+        if data.empty: return pd.DataFrame()
+        if isinstance(data.columns, pd.MultiIndex):
+            ck = next((k for k in data.columns.get_level_values(0).unique()
+                       if str(k).lower()=="close"), None)
+            if ck is None: return pd.DataFrame()
+            df = data[ck].copy()
+            if isinstance(df, pd.Series): df = df.to_frame(name=tickers[0])
+        else:
+            ck = next((k for k in data.columns if str(k).lower()=="close"), None)
+            if ck is None: return pd.DataFrame()
+            df = pd.DataFrame({tickers[0]: data[ck]})
+        if hasattr(df.index, "tz") and df.index.tz is not None:
+            df.index = df.index.tz_convert("Europe/Paris").tz_localize(None)
+        return df.dropna(how="all")
+    except Exception:
+        return pd.DataFrame()
+
+
+def make_sorted_hover_trace(shown, sliced):
+    """Invisible ghost trace whose hover text lists all ETFs sorted by % return (desc)."""
+    all_pct = {}
+    for e in shown:
+        if e["ticker"] not in sliced.columns: continue
+        s = sliced[e["ticker"]].dropna()
+        if len(s) < 2: continue
+        all_pct[e["label"]] = ((s / s.iloc[0] * 100 - 100).round(2), e["color"])
+    if not all_pct:
+        return None
+    all_date_set: set = set()
+    for ser, _ in all_pct.values():
+        all_date_set |= set(ser.index)
+    all_dates = sorted(all_date_set)
+    texts = []
+    for date in all_dates:
+        vals = [(lbl, float(ser.loc[date]), col)
+                for lbl, (ser, col) in all_pct.items() if date in ser.index]
+        vals.sort(key=lambda x: x[1], reverse=True)
+        texts.append("<br>".join(
+            f"<span style='color:{c}'>●  {n}</span>  {v:+.1f}%" for n, v, c in vals
+        ))
+    return go.Scatter(
+        x=all_dates, y=[0] * len(all_dates), mode="none",
+        showlegend=False, name="",
+        hovertemplate="%{text}<extra></extra>",
+        text=texts,
+    )
+
 
 # ── Session state ──────────────────────────────────────────────────────────────
 for k,v in [("vis_default",None),("vis_custom",None),("custom_selection",[])]:
@@ -300,7 +357,11 @@ def render_dashboard(etf_list, prices, tab_key):
     ) or "1A"
     pk = PERIODS[period_label]
     start = period_start(pk)
-    sliced = prices.loc[prices.index>=start]
+    if pk == "1d":
+        _intra = load_intraday_prices(",".join(e["ticker"] for e in available))
+        sliced = _intra if not _intra.empty else prices.loc[prices.index >= start]
+    else:
+        sliced = prices.loc[prices.index >= start]
 
     # ── Metric cards ───────────────────────────────────────────────────────
     rets = {e["name"]: pct_ret(sliced[e["ticker"]].dropna()) for e in available}
@@ -336,7 +397,7 @@ def render_dashboard(etf_list, prices, tab_key):
             x=pct_s.index, y=pct_s.values,
             name=e["label"],
             line=dict(color=e["color"], width=2),
-            hovertemplate=f"<b style='color:{e['color']}'>{e['label']}</b>  %{{y:+.1f}}%<extra></extra>"
+            hoverinfo="skip",
         ))
         fig.add_annotation(
             x=pct_s.index[-1], y=last,
@@ -344,6 +405,9 @@ def render_dashboard(etf_list, prices, tab_key):
             showarrow=False, xanchor="left",
             font=dict(size=11, color=e["color"], weight=700)
         )
+    _ghost = make_sorted_hover_trace(shown, sliced)
+    if _ghost is not None:
+        fig.add_trace(_ghost)
     fig.update_layout(
         height=400, margin=dict(l=0,r=80,t=10,b=0),
         hovermode="x unified",
@@ -579,7 +643,11 @@ with tab_custom:
             else:
                 avail_c = [e for e in etf_c if e["ticker"] in prices_c.columns]
                 start_c = period_start(pk_c)
-                sl_c    = prices_c.loc[prices_c.index >= start_c]
+                if pk_c == "1d":
+                    _intra_c = load_intraday_prices(",".join(e["ticker"] for e in etf_c))
+                    sl_c = _intra_c if not _intra_c.empty else prices_c.loc[prices_c.index >= start_c]
+                else:
+                    sl_c = prices_c.loc[prices_c.index >= start_c]
 
                 # ── Metrics (in reserved slot above chart) ─────────────────
                 rets_c = {e["name"]: pct_ret(sl_c[e["ticker"]].dropna())
@@ -610,13 +678,16 @@ with tab_custom:
                     fig_c.add_trace(go.Scatter(
                         x=pct_s.index, y=pct_s.values, name=e["label"],
                         line=dict(color=e["color"], width=2),
-                        hovertemplate=f"<b style='color:{e['color']}'>{e['label']}</b>  %{{y:+.1f}}%<extra></extra>"
+                        hoverinfo="skip",
                     ))
                     fig_c.add_annotation(
                         x=pct_s.index[-1], y=last,
                         text=f" {last:+.1f}%", showarrow=False, xanchor="left",
                         font=dict(size=11, color=e["color"], weight=700)
                     )
+                _ghost_c = make_sorted_hover_trace(shown_c, sl_c)
+                if _ghost_c is not None:
+                    fig_c.add_trace(_ghost_c)
                 fig_c.update_layout(
                     height=400, margin=dict(l=0, r=80, t=10, b=0),
                     hovermode="x unified",
