@@ -50,7 +50,6 @@ DEFAULT_ETFS = [
     {"ticker":"GOLD.PA",  "name":"GOLD",  "label":"Or physique"},
     {"ticker":"MMS.PA",   "name":"MMS",   "label":"Small Caps Europe"},
     {"ticker":"RS2K.PA",  "name":"RS2K",  "label":"Russell 2000 US"},
-    {"ticker":"IROB.DE",  "name":"IROB",  "label":"Robotique mondiale"},
     {"ticker":"TNO.PA",   "name":"TNO",   "label":"Tech Europe 600"},
     {"ticker":"SEME.PA",  "name":"SEME",  "label":"Semiconducteurs"},
 ]
@@ -179,7 +178,31 @@ def load_prices(tickers_key):
             df.index = df.index.tz_localize(None)
         else:
             df.index = pd.to_datetime(df.index)
-        return df.dropna(how="all")
+        df = df.dropna(how="all")
+
+        # ── Retry: re-download individually any ticker that's missing or all-NaN ──
+        missing = [t for t in tickers
+                   if t not in df.columns or df[t].isna().all()]
+        for t in missing:
+            try:
+                sd = yf.download(t, period="5y", auto_adjust=True, progress=False)
+                if sd.empty: continue
+                if isinstance(sd.columns, pd.MultiIndex):
+                    sck = next((k for k in sd.columns.get_level_values(0).unique()
+                                if str(k).lower()=="close"), None)
+                    if sck is None: continue
+                    series = sd[sck].squeeze()
+                else:
+                    sck = next((k for k in sd.columns if str(k).lower()=="close"), None)
+                    if sck is None: continue
+                    series = sd[sck]
+                if hasattr(series.index,"tz") and series.index.tz is not None:
+                    series.index = series.index.tz_localize(None)
+                df[t] = series.reindex(df.index)
+            except Exception:
+                pass
+
+        return df
     except Exception:
         return pd.DataFrame()
 
@@ -341,6 +364,161 @@ def _run_portfolio_analysis(avail, prices, period_label, pk):
                      f"{'Bien diversifié.' if n >= 6 else 'Peu diversifié — envisager dajouterdes actifs décorrélés.'}")
 
     lines.append("\n---\n*Analyse basée sur les données Yahoo Finance — pas un conseil financier.*")
+    return lines
+
+
+def _run_arbitrage_analysis(avail, prices):
+    """
+    Analyse d'arbitrage règle-par-règle : compare les performances relatives
+    sur 3 horizons et propose des arbitrages chiffrés.
+    Aucune API key requise — calcul Python pur sur données Yahoo Finance.
+    """
+    if len(avail) < 2:
+        return ["Il faut au moins 2 actifs pour un arbitrage."]
+
+    lines = []
+
+    # ── 1. Collecter les rendements sur tous les horizons ──────────────────
+    horizon_keys = [("1S","1w"),("1M","1mo"),("3M","3mo"),("6M","6mo"),("YTD","ytd"),("1A","1y")]
+    all_rets: dict[str, dict] = {}
+    for lbl, key in horizon_keys:
+        start_h = period_start(key)
+        sl = prices.loc[prices.index >= start_h]
+        for e in avail:
+            if e["ticker"] not in sl.columns: continue
+            r = pct_ret(sl[e["ticker"]].dropna())
+            if e["name"] not in all_rets:
+                all_rets[e["name"]] = {"label": e["label"], "ticker": e["ticker"]}
+            all_rets[e["name"]][lbl] = r
+
+    if not all_rets:
+        return ["Données insuffisantes."]
+
+    # ── 2. Volatilité annualisée ───────────────────────────────────────────
+    vols: dict[str, float] = {}
+    for e in avail:
+        s = prices[e["ticker"]].dropna()
+        if len(s) > 30:
+            lr = np.log(s / s.shift(1)).dropna()
+            vols[e["name"]] = lr.std() * np.sqrt(252) * 100
+
+    # ── 3. Signal momentum : court terme vs long terme ─────────────────────
+    # Sharpe-like score pour chaque horizon : ret / vol annualisée
+    def sharpe_proxy(name, period):
+        r = all_rets.get(name, {}).get(period)
+        v = vols.get(name, 15)
+        if r is None: return None
+        return r / v * 10  # normalised
+
+    # ── 4. Analyse par horizon ─────────────────────────────────────────────
+    horizons = [
+        ("Court terme",  ["1S", "1M"],   "1 semaine / 1 mois",   0.7),
+        ("Moyen terme",  ["3M", "6M"],   "3 mois / 6 mois",      0.8),
+        ("Long terme",   ["YTD", "1A"],  "YTD / 1 an",           0.9),
+    ]
+
+    for horizon_name, periods, period_desc, sigma_thresh in horizons:
+        scores: dict[str, tuple[float, str]] = {}
+        for name, data in all_rets.items():
+            vals = [data.get(p) for p in periods if data.get(p) is not None]
+            if vals:
+                scores[name] = (float(np.mean(vals)), data["label"])
+
+        if len(scores) < 2:
+            continue
+
+        avg = float(np.mean([v[0] for v in scores.values()]))
+        std = float(np.std([v[0] for v in scores.values()]))
+        if std < 0.5:
+            std = 0.5  # avoid division by near-zero
+
+        # Seuil : ±sigma_thresh * std au-dessus/en-dessous de la moyenne
+        trim_thresh  = avg + sigma_thresh * std
+        add_thresh   = avg - sigma_thresh * std
+
+        trimmer  = sorted([(n, v) for n, v in scores.items() if v[0] >= trim_thresh],
+                          key=lambda x: x[1][0], reverse=True)
+        renforce = sorted([(n, v) for n, v in scores.items() if v[0] <= add_thresh],
+                          key=lambda x: x[1][0])
+        conserve = [(n, v) for n, v in scores.items()
+                    if n not in {x[0] for x in trimmer} and n not in {x[0] for x in renforce}]
+
+        lines.append(f"\n### 📊 {horizon_name} — {period_desc}")
+
+        if trimmer:
+            lines.append("**🔴 Alléger / Prise de bénéfices**")
+            for name, (ret, label) in trimmer:
+                perfs = "  ·  ".join(
+                    f"{p} **{all_rets[name].get(p):+.1f}%**"
+                    for p in periods if all_rets[name].get(p) is not None
+                )
+                vol_str = f"  ·  vol {vols[name]:.0f}%/an" if name in vols else ""
+                gap = ret - avg
+                lines.append(
+                    f"- **{label}** : {perfs}{vol_str}  "
+                    f"→ +{gap:.1f}pp au-dessus de la moyenne. "
+                    f"Sur-performance marquée — envisager une prise de bénéfices partielle."
+                )
+
+        if renforce:
+            lines.append("**🟢 Renforcer / Réallouer**")
+            for name, (ret, label) in renforce:
+                perfs = "  ·  ".join(
+                    f"{p} **{all_rets[name].get(p):+.1f}%**"
+                    for p in periods if all_rets[name].get(p) is not None
+                )
+                vol_str = f"  ·  vol {vols[name]:.0f}%/an" if name in vols else ""
+                gap = avg - ret
+                lines.append(
+                    f"- **{label}** : {perfs}{vol_str}  "
+                    f"→ {gap:.1f}pp sous la moyenne. "
+                    f"Sous-performance relative — potentiel de rattrapage ou de mean-reversion."
+                )
+
+        if conserve:
+            c_names = ", ".join(f"**{v[1]}**" for _, v in conserve[:6])
+            if len(conserve) > 6:
+                c_names += f" *(+{len(conserve)-6} autres)*"
+            lines.append(f"**⚪ Conserver** : {c_names}")
+
+        # Suggestion d'arbitrage concrète
+        if trimmer and renforce:
+            best_trim  = trimmer[0]
+            best_add   = renforce[0]
+            trim_ret   = best_trim[1][0]
+            add_ret    = best_add[1][0]
+            spread     = trim_ret - add_ret
+            lines.append(
+                f"\n💡 *Arbitrage suggéré : alléger **{best_trim[1][1]}** "
+                f"({trim_ret:+.1f}%) pour renforcer **{best_add[1][1]}** "
+                f"({add_ret:+.1f}%) — écart {spread:.1f}pp sur cet horizon.*"
+            )
+
+    # ── 5. Signal momentum croisé : 1M vs 1A ──────────────────────────────
+    momentum_signals = []
+    for name, data in all_rets.items():
+        ret_1m = data.get("1M")
+        ret_1a = data.get("1A")
+        if ret_1m is None or ret_1a is None: continue
+        # Momentum positif : court terme accélère par rapport au long terme
+        monthly_run_rate = ret_1m * 12  # annualisé
+        if monthly_run_rate > ret_1a * 1.5 and ret_1m > 0:
+            momentum_signals.append((data["label"], ret_1m, ret_1a, "accélère 🚀"))
+        elif monthly_run_rate < ret_1a * 0.3 and ret_1a > 5:
+            momentum_signals.append((data["label"], ret_1m, ret_1a, "décélère ⚠️"))
+
+    if momentum_signals:
+        lines.append("\n### 📡 Signaux momentum (1M vs 1A annualisé)")
+        for label, r1m, r1a, signal in momentum_signals:
+            lines.append(
+                f"- **{label}** : 1M {r1m:+.1f}% (annualisé {r1m*12:+.0f}%) vs 1A {r1a:+.1f}% — {signal}"
+            )
+
+    lines.append(
+        "\n---\n"
+        "*Analyse basée sur les performances relatives et la volatilité — "
+        "pas un conseil en investissement. Diversification et horizon personnel restent primordiaux.*"
+    )
     return lines
 
 
@@ -538,6 +716,19 @@ def render_dashboard(etf_list, prices, tab_key):
             st.plotly_chart(fc, width="stretch")
         else:
             st.caption("Données insuffisantes.")
+
+    # ── Arbitrage IA ───────────────────────────────────────────────────────
+    with st.expander("⚖️ Arbitrages suggérés", expanded=False):
+        st.caption(
+            "ℹ️ Analyse statistique des performances relatives sur 3 horizons. "
+            "Identifie les actifs à alléger (sur-performance) et ceux à renforcer (sous-performance). "
+            "Inclut un signal momentum croisé 1M vs 1A."
+        )
+        if st.button("✨ Analyser les arbitrages", key=f"arb_{tab_key}"):
+            with st.spinner("Analyse en cours…"):
+                _arb = _run_arbitrage_analysis(available, prices)
+            for line in _arb:
+                st.markdown(line)
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 cr, cb2 = st.columns([9,1])
@@ -879,6 +1070,19 @@ setTimeout(function() {{
                                 avail_c, prices_c, period_c, pk_c
                             )
                         for line in _insights:
+                            st.markdown(line)
+
+                # ── Arbitrage IA ────────────────────────────────────────────
+                with st.expander("⚖️ Arbitrages suggérés", expanded=False):
+                    st.caption(
+                        "ℹ️ Analyse statistique des performances relatives sur 3 horizons. "
+                        "Identifie les actifs à alléger (sur-performance) et ceux à renforcer (sous-performance). "
+                        "Inclut un signal momentum croisé 1M vs 1A."
+                    )
+                    if st.button("✨ Analyser les arbitrages", key="arb_c"):
+                        with st.spinner("Analyse en cours…"):
+                            _arb_c = _run_arbitrage_analysis(avail_c, prices_c)
+                        for line in _arb_c:
                             st.markdown(line)
 
 st.divider()
